@@ -157,10 +157,11 @@ class MAEEGContext(nn.Module):
         return out
 
 class MAEEGConvDecoder(nn.Module):
-    def __init__(self, input_channel, output_channel, kernel_size, upsample_size, dropout):
+    def __init__(self, input_channel, output_channel, kernel_size, upsample_size, dropout, output_size):
         super().__init__()
         self.input_channel = input_channel
         self.output_channel = output_channel
+        self.output_size = output_size
 
         if not isinstance(kernel_size, (list, tuple)):
             kernel_size = [kernel_size]
@@ -176,10 +177,11 @@ class MAEEGConvDecoder(nn.Module):
         self.decoder = nn.Sequential()
 
         for i, (kernel, upsample) in enumerate(zip(self.kernel_size, self.upsample_size)):
+            output_padding = upsample - 1 if self.output_size[i] % upsample == 0 else self.output_size[i] % upsample - 1
             if i != len(kernel_size) - 1:
                 self.decoder.add_module(f"MAEEG decoder {i}", nn.Sequential(
                     nn.ConvTranspose1d(input_channel, input_channel, kernel_size=kernel, stride=upsample,
-                                       padding=kernel//2, output_padding=upsample-1),
+                                       padding=kernel//2, output_padding=output_padding),
                     nn.Dropout(dropout),
                     nn.GroupNorm(input_channel // 2, input_channel),
                     nn.GELU()
@@ -187,7 +189,7 @@ class MAEEGConvDecoder(nn.Module):
             else:
                 self.decoder.add_module(f"MAEEG decoder {i}", nn.Sequential(
                     nn.ConvTranspose1d(input_channel, output_channel, kernel_size=kernel, stride=upsample,
-                                       padding=kernel//2, output_padding=upsample-1),
+                                       padding=kernel//2, output_padding=output_padding),
                 ))
 
     def forward(self, x):
@@ -197,7 +199,7 @@ class MAEEGConvDecoder(nn.Module):
 
 class MAEEGReconstruction(nn.Module):
     def __init__(self, input_channel, embed_size, downsample_size, kernel_size, dropout,
-                 heads, forward_neuron, num_transformers, mask_p, mask_span):
+                 heads, forward_neuron, num_transformers, mask_p, mask_span, output_size):
         super().__init__()
         self.maeeg_encoder = MAEEGConvolution(input_channel=input_channel, output_channel=embed_size,
                                               downsample_size=downsample_size, kernel_size=kernel_size,
@@ -206,7 +208,7 @@ class MAEEGReconstruction(nn.Module):
                                                       num_transformers=num_transformers)
         self.maeeg_decoder = MAEEGConvDecoder(input_channel=embed_size, output_channel=input_channel,
                                               upsample_size=downsample_size, kernel_size=kernel_size,
-                                              dropout=dropout)
+                                              dropout=dropout, output_size=output_size)
         self.mask_p = mask_p
         self.mask_span = mask_span
 
@@ -228,6 +230,46 @@ class MAEEGReconstruction(nn.Module):
         torch.save(self.transformer_encoder.state_dict(), path)
 
 
+class MAEEGReconstructionV2(nn.Module):
+    def __init__(self, input_channel, embed_size, downsample_size, kernel_size, dropout,
+                 heads, forward_neuron, num_transformers, mask_p, mask_span, output_size):
+        super().__init__()
+        self.maeeg_encoder = MAEEGConvolution(input_channel=input_channel, output_channel=embed_size,
+                                              downsample_size=downsample_size, kernel_size=kernel_size,
+                                              dropout=dropout)
+        self.transformer_encoder = TransformerEncoder(embed_size=embed_size, heads=heads, forward_neuron=forward_neuron,
+                                                      num_transformers=num_transformers)
+        self.maeeg_decoder = MAEEGConvDecoder(input_channel=embed_size, output_channel=input_channel,
+                                              upsample_size=downsample_size, kernel_size=kernel_size,
+                                              dropout=dropout, output_size=output_size)
+        self.mask_p = mask_p
+        self.mask_span = mask_span
+
+    def forward(self, x):
+        out = self.maeeg_encoder(x)
+        out = self.transformer_encoder(out)
+        out = self.maeeg_decoder(out)
+        return out
+
+    def forward_mask(self, x):
+        out = self.maeeg_encoder(x)
+        batch, len_seq, len_feature = out.shape
+        self.mask = make_mask(shape=(batch, len_seq), p=self.mask_p, total=len_seq,
+                              span=self.mask_span, allow_no_inds=False)
+        mask_replacement = torch.nn.Parameter(torch.zeros(len_feature), requires_grad=True)
+        out[self.mask] = mask_replacement
+        out = self.transformer_encoder(out)
+        out = self.maeeg_decoder(out)
+        return out
+
+    def save_convolution(self, path):
+        torch.save(self.maeeg_encoder.state_dict(), path)
+
+    def save_transformer(self, path):
+        torch.save(self.transformer_encoder.state_dict(), path)
+
+
+
 class BinaryClassifier(nn.Module):
     def __init__(self, fc_neuron):
         super().__init__()
@@ -245,6 +287,23 @@ class BinaryClassifier(nn.Module):
             self.linear1 = nn.Linear(in_features=in_features, out_features=self.fc_neuron)
         out = self.relu(self.linear1(out))
         out = self.linear2(out)
+        out = self.sigmoid(out)
+        return out
+
+
+class BinaryClassifierV2(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.linear = nn.Linear(in_features=1, out_features=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        out = self.flatten(x)
+        batch, in_features = out.shape
+        if self.linear.in_features == 1:
+            self.linear = nn.Linear(in_features=in_features, out_features=1)
+        out = self.linear(out)
         out = self.sigmoid(out)
         return out
 
@@ -284,6 +343,42 @@ class MAEEGClassification(nn.Module):
         return out
 
 
+class MAEEGClassificationV2(nn.Module):
+    def __init__(self, input_channel, embed_size, downsample_size,
+                 kernel_size, dropout, heads, forward_neuron,
+                 num_transformers, use_transformer=False):
+        super().__init__()
+        self.maeeg_encoder = MAEEGConvolution(input_channel=input_channel, output_channel=embed_size,
+                                              downsample_size=downsample_size, kernel_size=kernel_size,
+                                              dropout=dropout)
+        self.transformer_encoder = TransformerEncoder(embed_size=embed_size, heads=heads, forward_neuron=forward_neuron,
+                                                      num_transformers=num_transformers)
+        self.classifier = BinaryClassifierV2()
+        self.use_transformer = use_transformer
+
+    def load_convolution_encoder(self, path):
+        self.maeeg_encoder.load_state_dict(torch.load(path))
+
+    def load_transformer_encoder(self, path):
+        self.transformer_encoder.load_state_dict(torch.load(path))
+
+    def freeze_convolution(self):
+        for param in self.maeeg_encoder.parameters():
+            param.requires_grad = False
+
+    def freeze_transformer(self):
+        for param in self.transformer_encoder.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        out = self.maeeg_encoder(x)
+        if self.use_transformer:
+            out = self.transformer_encoder(out)
+        out = self.classifier(out)
+        return out
+
+
+# I don't use this class
 class ReconstructionLoss(nn.Module):
     def __init__(self, mask):
         super().__init__()
